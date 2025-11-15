@@ -1,0 +1,874 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import * as THREE from "three";
+import Matter from "matter-js";
+import { usePlayer } from "../lib/stores/usePlayer";
+import { useEnemies } from "../lib/stores/useEnemies";
+import { useDungeon } from "../lib/stores/useDungeon";
+import { bounceAgainstBounds } from "../lib/collision";
+import { useGame } from "../lib/stores/useGame";
+import { useAudio } from "../lib/stores/useAudio";
+import { useInventory } from "../lib/stores/useInventory";
+import { useSpellSlots } from "../lib/stores/useSpellSlots";
+import { useProjectiles } from "../lib/stores/useProjectiles";
+import SpellSlotsHUD from "./SpellSlotsHUD";
+import CardManager from "./CardManager";
+import swordSrc from "/images/sword.png";
+
+const TILE_SIZE = 32;
+const CANVAS_WIDTH = 800;
+const CANVAS_HEIGHT = 600;
+const ROOM_SIZE = 40;
+
+
+const ENEMY_HIT_RADIUS = 0.5;
+const KNOCKBACK_FORCE = 10;
+
+interface Position {
+  x: number;
+  y: number;
+  z: number;
+}
+
+
+interface TerrainObstacle {
+  x: number;
+  z: number;
+  width: number;
+  height: number;
+  type: 'rock' | 'pillar' | 'wall';
+}
+
+// Generate cave-like terrain for a room
+function generateRoomTerrain(roomX: number, roomY: number): TerrainObstacle[] {
+  const obstacles: TerrainObstacle[] = [];
+  const seed = roomX * 1000 + roomY;
+  
+  // Seeded random function
+  const seededRandom = (n: number) => {
+    const x = Math.sin(seed + n) * 1000;
+    return x - Math.floor(x);
+  };
+
+  // Add rocky outcroppings along walls (cave-like feel)
+  const numOutcrops = 400;
+  
+  for (let i = 0; i < numOutcrops; i++) {
+    const side = Math.floor(seededRandom(i * 20) * 4); // 0=north, 1=south, 2=east, 3=west
+    const position = seededRandom(i * 10 - 10) * 70 - 35; // Position along the wall
+    const depth = seededRandom(i * 10 + 7) * 10 + 2; // How far it juts out
+    const width = seededRandom(i * 10 + 9) * 8 + 3; // Width of outcrop
+    
+    switch(side) {
+      case 0: // North wall
+        obstacles.push({
+          x: position,
+          z: -ROOM_SIZE + depth / 2,
+          width: width,
+          height: depth,
+          type: 'rock'
+        });
+        break;
+      case 1: // South wall
+        obstacles.push({
+          x: position,
+          z: ROOM_SIZE - depth / 2,
+          width: width,
+          height: depth,
+          type: 'rock'
+        });
+        break;
+      case 2: // East wall
+        obstacles.push({
+          x: ROOM_SIZE - depth / 2,
+          z: position,
+          width: depth,
+          height: width,
+          type: 'rock'
+        });
+        break;
+      case 3: // West wall
+        obstacles.push({
+          x: -ROOM_SIZE + depth / 2,
+          z: position,
+          width: depth,
+          height: width,
+          type: 'rock'
+        });
+        break;
+    }
+  }
+
+  // Add some pillars/stalagmites in the room
+  const numPillars = Math.floor(seededRandom(100) * 2) + 1;
+  
+  for (let i = 0; i < numPillars; i++) {
+    const x = (seededRandom(i * 20 + 100) - 0.5) * 25;
+    const z = (seededRandom(i * 20 + 105) - 0.5) * 25;
+    const size = seededRandom(i * 20 + 110) * 2 + 1.5;
+    
+    // Don't place pillars too close to center (spawn point)
+    if (Math.hypot(x, z) > 5) {
+      obstacles.push({
+        x: x,
+        z: z,
+        width: size,
+        height: size,
+        type: 'pillar'
+      });
+    }
+  }
+
+  return obstacles;
+}
+
+// Check collision with terrain
+function checkTerrainCollision(
+  pos: THREE.Vector3,
+  obstacles: TerrainObstacle[],
+  radius: number
+): { collision: boolean; normal?: THREE.Vector2 } {
+  for (const obs of obstacles) {
+    // AABB collision detection
+    const closestX = Math.max(obs.x - obs.width / 2, Math.min(pos.x, obs.x + obs.width / 2));
+    const closestZ = Math.max(obs.z - obs.height / 2, Math.min(pos.z, obs.z + obs.height / 2));
+    
+    const distX = pos.x - closestX;
+    const distZ = pos.z - closestZ;
+    const distSq = distX * distX + distZ * distZ;
+    
+    if (distSq < radius * radius) {
+      // Calculate normal for collision response
+      const dist = Math.sqrt(distSq);
+      const normal = new THREE.Vector2(distX / dist, distZ / dist);
+      return { collision: true, normal };
+    }
+  }
+  
+  return { collision: false };
+}
+
+export default function CanvasGame() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const animationFrameRef = useRef<number>();
+  const keysPressed = useRef<Set<string>>(new Set());
+  const lastTimeRef = useRef<number>(0);
+  
+  const terrainRef = useRef<TerrainObstacle[]>([]);
+
+  const { phase, end } = useGame();
+  const {
+    position,
+    health,
+    maxHealth,
+    speed,
+    canAttack,
+    attackRange,
+    attack,
+    setCanAttack,
+    takeDamage: playerTakeDamage,
+  } = usePlayer();
+  const { 
+    slots, 
+    activeSlotId, 
+    getSlotStats, 
+    startCooldown, 
+    updateCooldowns 
+  } = useSpellSlots();
+  
+  const { 
+    projectiles, 
+    addProjectile, 
+    updateProjectiles 
+  } = useProjectiles();
+
+  const [showCardManager, setShowCardManager] = useState(false);
+
+  const movePlayer = usePlayer((s) => s.move);
+  const player = usePlayer.getState();
+  const mouseRef = useRef<{x: number; y: number}>({ x: 0, y: 0 });
+  const { enemies, updateEnemies, removeEnemy } = useEnemies();
+  const { currentRoom, changeRoom } = useDungeon();
+  const { playHit, playSuccess } = useAudio();
+  const { items, addItem } = useInventory();
+
+  // Generate terrain when room changes
+  useEffect(() => {
+    if (currentRoom) {
+      terrainRef.current = generateRoomTerrain(currentRoom.x, currentRoom.y);
+    }
+  }, [currentRoom]);
+
+  // --- Keyboard handlers ---
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => keysPressed.current.add(e.code);
+    const handleKeyUp = (e: KeyboardEvent) => keysPressed.current.delete(e.code);
+    
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+    };
+  }, [position]);
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
+      mouseRef.current = {
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top,
+      };
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    return () => window.removeEventListener("mousemove", handleMouseMove);
+  }, []);
+
+  // --- Weapon attack handler ---
+  useEffect(() => {
+    const handleClick = (e: MouseEvent) => {
+      const activeSlot = slots.find(s => s.id === activeSlotId);
+      if (!activeSlot || activeSlot.isOnCooldown) return;
+
+      const rect = canvasRef.current!.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+
+      const centerX = CANVAS_WIDTH / 2;
+      const centerY = CANVAS_HEIGHT / 2;
+      
+      // Get stats for this slot
+      const stats = getSlotStats(activeSlotId);
+      const ps = usePlayer.getState();
+      
+      // Calculate base direction
+      const baseAngle = Math.atan2(mouseY - centerY, mouseX - centerX);
+      
+      // Fire multiple projectiles if needed
+      const spreadAngle = stats.projectileCount > 1 ? 0.2 : 0;
+      for (let i = 0; i < stats.projectileCount; i++) {
+        // Calculate angle with spread
+        let angle = baseAngle;
+        if (stats.projectileCount > 1) {
+          const offset = (i - (stats.projectileCount - 1) / 2) * spreadAngle;
+          angle += offset;
+        }
+        
+        // Apply accuracy modifier (inaccuracy adds random spread)
+        const inaccuracy = (1 - stats.accuracy) * 0.3;
+        angle += (Math.random() - 0.5) * inaccuracy;
+        
+        const direction = new THREE.Vector3(
+          Math.cos(angle),
+          0,
+          Math.sin(angle)
+        );
+        
+        addProjectile({
+          position: ps.position.clone(),
+          direction: direction,
+          slotId: activeSlotId,
+          damage: stats.damage,
+          speed: stats.speed,
+          range: stats.range,
+          homing: stats.homing,
+          piercing: stats.piercing,
+          bouncing: stats.bouncing,
+          explosive: stats.explosive,
+          chainLightning: stats.chainLightning,
+        });
+      }
+      
+      // Start cooldown
+      startCooldown(activeSlotId);
+      
+      // Play sound effect
+      playHit();
+    };
+
+    window.addEventListener("click", handleClick);
+    return () => window.removeEventListener("click", handleClick);
+  }, [activeSlotId, slots, addProjectile, getSlotStats, startCooldown]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.code === "KeyC") {
+        setShowCardManager(prev => !prev);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+
+  // --- Main game loop ---
+  useEffect(() => {
+    const gameLoop = (currentTime: number) => {
+      const delta = lastTimeRef.current ? (currentTime - lastTimeRef.current) / 1000 : 0;
+      
+      lastTimeRef.current = currentTime;
+      if (!canvasRef.current) return;
+
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+
+      ctx.fillStyle = "#1a1a1a";
+      ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+      if (currentRoom) drawDungeon(ctx);
+      
+
+      // --- Player movement with terrain collision ---
+      let moveX = 0;
+      let moveZ = 0;
+      if (keysPressed.current.has("KeyW") || keysPressed.current.has("ArrowUp")) moveZ -= 1;
+      if (keysPressed.current.has("KeyS") || keysPressed.current.has("ArrowDown")) moveZ += 1;
+      if (keysPressed.current.has("KeyA") || keysPressed.current.has("ArrowLeft")) moveX -= 1;
+      if (keysPressed.current.has("KeyD") || keysPressed.current.has("ArrowRight")) moveX += 1;
+
+      if (moveX || moveZ) {
+        const len = Math.sqrt(moveX ** 2 + moveZ ** 2) || 1;
+        moveX = (moveX / len) * speed * delta;
+        moveZ = (moveZ / len) * speed * delta;
+        
+        const newPos = new THREE.Vector3(
+          position.x + moveX,
+          position.y,
+          position.z + moveZ
+        );
+        
+        // Check terrain collision
+        const terrainCheck = checkTerrainCollision(newPos, terrainRef.current, 0.8);
+        
+        if (!terrainCheck.collision) {
+          movePlayer(new THREE.Vector3(moveX, 0, moveZ));
+        } else if (terrainCheck.normal) {
+          // Slide along obstacle
+          const slideX = moveX - terrainCheck.normal.x * (moveX * terrainCheck.normal.x + moveZ * terrainCheck.normal.y);
+          const slideZ = moveZ - terrainCheck.normal.y * (moveX * terrainCheck.normal.x + moveZ * terrainCheck.normal.y);
+          
+          const slidePos = new THREE.Vector3(position.x + slideX, position.y, position.z + slideZ);
+          const slideCheck = checkTerrainCollision(slidePos, terrainRef.current, 0.8);
+          
+          if (!slideCheck.collision) {
+            movePlayer(new THREE.Vector3(slideX, 0, slideZ));
+          }
+        }
+
+        const ps = usePlayer.getState();
+        const { position: newPos2, velocity: newVel } = bounceAgainstBounds(ps.position, ps.velocity, ROOM_SIZE, 0.65);
+        usePlayer.setState({ position: newPos2, velocity: newVel });
+      }
+
+      if (player.velocity) {
+        movePlayer(new THREE.Vector3(player.velocity.x * delta, 0, player.velocity.z * delta));
+
+        const ps = usePlayer.getState();
+        const bounced = bounceAgainstBounds(ps.position, ps.velocity, ROOM_SIZE, 0.6);
+        usePlayer.setState({ position: bounced.position, velocity: bounced.velocity });
+
+        const newVel = usePlayer.getState().velocity.clone().multiplyScalar(Math.max(0, 1 - 6 * delta));
+        usePlayer.setState({ velocity: newVel });
+      }
+      //spells
+      
+      updateProjectiles(
+        delta,
+        enemies,
+        position,
+        ROOM_SIZE,
+        (enemyId, damage, knockback) => {
+          // Handle enemy hit
+          const enemy = enemies.find(e => e.id === enemyId);
+          if (enemy) {
+            enemy.health -= damage;
+            if (!enemy.velocity) enemy.velocity = new THREE.Vector3(0, 0, 0);
+            enemy.velocity.add(knockback);
+            playHit();
+            if (enemy.health <= 0) {
+              playSuccess();
+              removeEnemy(enemyId);
+            }
+          }
+        }
+      );
+
+      // --- Enemies movement with terrain collision ---
+      const updatedEnemies = enemies.map((enemy) => {
+        const dx = position.x - enemy.position.x;
+        const dz = position.z - enemy.position.z;
+        const distance = Math.sqrt(dx * dx + dz * dz);
+
+        if (distance <= enemy.detectionRange) {
+          const dirX = dx / distance;
+          const dirZ = dz / distance;
+          
+          const moveAmount = enemy.speed * delta;
+          const newEnemyPos = new THREE.Vector3(
+            enemy.position.x + dirX * moveAmount,
+            0,
+            enemy.position.z + dirZ * moveAmount
+          );
+          
+          // Check terrain collision for enemy
+          const enemyTerrainCheck = checkTerrainCollision(newEnemyPos, terrainRef.current, 0.7);
+          
+          if (!enemyTerrainCheck.collision) {
+            enemy.position.x = newEnemyPos.x;
+            enemy.position.z = newEnemyPos.z;
+          }
+          
+          enemy.state = "chasing";
+
+          if (distance <= enemy.attackRange && enemy.canAttack) {
+            const damage = Math.max(enemy.speed - (player.attackRange || 0), 0);
+            playerTakeDamage(damage);
+            playHit();
+            enemy.canAttack = false;
+            enemy.attackCooldown = enemy.attackCooldown;
+          }
+        } else if (enemy.state !== "patrolling") {
+          enemy.state = "patrolling";
+        }
+
+        if (enemy.attackCooldown > 0) {
+          enemy.attackCooldown -= delta;
+          if (enemy.attackCooldown <= 0) enemy.canAttack = true;
+        }
+
+        if (!enemy.velocity) enemy.velocity = new THREE.Vector3(0, 0, 0);
+        
+        // Apply velocity with terrain collision
+        const velNewPos = new THREE.Vector3(
+          enemy.position.x + enemy.velocity.x * delta,
+          0,
+          enemy.position.z + enemy.velocity.z * delta
+        );
+        
+        const velTerrainCheck = checkTerrainCollision(velNewPos, terrainRef.current, 0.7);
+        
+        if (!velTerrainCheck.collision) {
+          enemy.position.x = velNewPos.x;
+          enemy.position.z = velNewPos.z;
+        } else {
+          // Bounce off terrain
+          enemy.velocity.multiplyScalar(-0.5);
+        }
+        
+        enemy.velocity.multiplyScalar(Math.max(0, 1 - 6 * delta));
+
+        const bouncedEnemy = bounceAgainstBounds(enemy.position, enemy.velocity, ROOM_SIZE, 0.6);
+        enemy.position.copy(bouncedEnemy.position);
+        enemy.velocity.copy(bouncedEnemy.velocity);
+
+        drawEnemy(ctx, enemy);
+        return enemy;
+      });
+
+      // Enemy-Enemy separation
+      for (let i = 0; i < updatedEnemies.length; i++) {
+        for (let j = i + 1; j < updatedEnemies.length; j++) {
+          const e1 = updatedEnemies[i];
+          const e2 = updatedEnemies[j];
+          const dx = e1.position.x - e2.position.x;
+          const dz = e1.position.z - e2.position.z;
+          const dist = Math.hypot(dx, dz);
+          const minDist = 1;
+          if (dist > 0 && dist < minDist) {
+            const push = (minDist - dist) / 2;
+            const nx = dx / dist;
+            const nz = dz / dist;
+            e1.position.x += nx * push;
+            e1.position.z += nz * push;
+            e2.position.x -= nx * push;
+            e2.position.z -= nz * push;
+          }
+        }
+      }
+
+      const PLAYER_RADIUS = 1.1;
+      const ENEMY_RADIUS = 0.7;
+      const DAMPING = 1.5;
+
+      const aliveEnemies: typeof updatedEnemies = [];
+
+      for (const enemy of updatedEnemies) {
+        const dx = enemy.position.x - position.x;
+        const dz = enemy.position.z - position.z;
+        const dist = Math.hypot(dx, dz);
+
+        if (dist > 0 && dist < PLAYER_RADIUS + ENEMY_RADIUS) {
+          const overlap = PLAYER_RADIUS + ENEMY_RADIUS - dist;
+          const nx = dx / dist;
+          const nz = dz / dist;
+
+          enemy.position.x += nx * overlap * 0.6;
+          enemy.position.z += nz * overlap * 0.6;
+
+          usePlayer.setState((s) => {
+            const v = s.velocity ? s.velocity.clone() : new THREE.Vector3(0, 0, 0);
+            v.add(new THREE.Vector3(-nx * overlap * KNOCKBACK_FORCE * 10, 100000, -nz * overlap * KNOCKBACK_FORCE * 10));
+            return { velocity: v };
+          });
+
+          if (!enemy.velocity) enemy.velocity = new THREE.Vector3(0, 0, 0);
+          enemy.velocity.add(new THREE.Vector3(nx * KNOCKBACK_FORCE, 0, nz * KNOCKBACK_FORCE));
+
+          if (enemy.canAttack) {
+            const damage = Math.max((enemy.attack ?? 1) - (player.defense ?? 0), 1);
+            playerTakeDamage(damage);
+            playHit();
+            enemy.canAttack = false;
+            enemy.attackCooldown = enemy.attackCooldown;
+          }
+        }
+
+        if (!enemy.velocity) enemy.velocity = new THREE.Vector3(0, 0, 0);
+        enemy.velocity.multiplyScalar(Math.max(0, 1 - DAMPING * delta));
+
+        const bounced = bounceAgainstBounds(enemy.position, enemy.velocity, ROOM_SIZE, 0.6);
+        enemy.position.copy(bounced.position);
+        enemy.velocity.copy(bounced.velocity);
+
+        if (enemy.health <= 0) {
+          removeEnemy(enemy.id);
+          playSuccess();
+          continue;
+        }
+
+        aliveEnemies.push(enemy);
+      }
+
+      updateEnemies(aliveEnemies);
+      updateCooldowns(delta);
+      drawPlayer(ctx);
+      drawProjectiles(ctx);
+      if (health <= 0) end();
+
+      animationFrameRef.current = requestAnimationFrame(gameLoop);
+    };
+
+    animationFrameRef.current = requestAnimationFrame(gameLoop);
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
+  }, [
+    position,
+    speed,
+    attackRange,
+    canAttack,
+    enemies,
+    attack,
+    player.attackRange,
+    updateEnemies,
+  ]);
+
+  
+
+  const drawDungeon = (ctx: CanvasRenderingContext2D) => {
+    if (!currentRoom) return;
+
+    const centerX = CANVAS_WIDTH / 2;
+    const centerY = CANVAS_HEIGHT / 2;
+
+    const floorSize = ROOM_SIZE * TILE_SIZE;
+
+    const offsetX = -position.x * TILE_SIZE / 2;
+    const offsetZ = -position.z * TILE_SIZE / 2;
+
+    ctx.fillStyle = "#2a2a2a";
+    ctx.fillRect(centerX - floorSize / 2 + offsetX, centerY - floorSize / 2 + offsetZ, floorSize, floorSize);
+
+    ctx.strokeStyle = "#333333";
+    ctx.lineWidth = 1;
+    for (let i = -ROOM_SIZE; i <= ROOM_SIZE; i += 2) {
+      const x = centerX + i * TILE_SIZE / 2 + offsetX;
+      const y = centerY + i * TILE_SIZE / 2 + offsetZ;
+
+      ctx.beginPath();
+      ctx.moveTo(x, centerY - floorSize / 2 + offsetZ);
+      ctx.lineTo(x, centerY + floorSize / 2 + offsetZ);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.moveTo(centerX - floorSize / 2 + offsetX, y);
+      ctx.lineTo(centerX + floorSize / 2 + offsetX, y);
+      ctx.stroke();
+    }
+
+    // Draw terrain obstacles
+    terrainRef.current.forEach(obstacle => {
+      const screenX = centerX + (obstacle.x - position.x) * TILE_SIZE / 2;
+      const screenY = centerY + (obstacle.z - position.z) * TILE_SIZE / 2;
+      const w = obstacle.width * TILE_SIZE / 2;
+      const h = obstacle.height * TILE_SIZE / 2;
+
+      if (obstacle.type === 'rock') {
+        // Rocky outcrop - darker brown
+        ctx.fillStyle = "#505050ff";
+        ctx.fillRect(screenX - w / 2, screenY - h / 2, w, h);
+        
+        // Add texture
+        ctx.fillStyle = "#484542ff";
+        ctx.fillRect(screenX - w / 2 + 2, screenY - h / 2 + 2, w / 3, h / 3);
+        ctx.fillRect(screenX + w / 6, screenY + h / 6, w / 4, h / 4);
+      } else if (obstacle.type === 'pillar') {
+        // Pillar/stalagmite
+        ctx.fillStyle = "#5a5a5a";
+        ctx.beginPath();
+        ctx.arc(screenX, screenY, w / 2, 0, Math.PI * 2);
+        ctx.fill();
+        
+        // Shadow
+        ctx.fillStyle = "rgba(0, 0, 0, 0.52)";
+        ctx.beginPath();
+        ctx.ellipse(screenX + 2, screenY + 2, w / 2 - 1, w / 3, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Outline
+      ctx.strokeStyle = "#1a1a1a";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(screenX - w / 2, screenY - h / 2, w, h);
+    });
+
+    ctx.fillStyle = "#555555";
+    const wallThickness = 20;
+
+    if (!currentRoom.exits.includes("north")) {
+      ctx.fillRect(centerX - floorSize / 2 + offsetX, centerY - floorSize / 2 - wallThickness + offsetZ, floorSize, wallThickness);
+    }
+    if (!currentRoom.exits.includes("south")) {
+      ctx.fillRect(centerX - floorSize / 2 + offsetX, centerY + floorSize / 2 + offsetZ, floorSize, wallThickness);
+    }
+    if (!currentRoom.exits.includes("east")) {
+      ctx.fillRect(centerX + floorSize / 2 + offsetX, centerY - floorSize / 2 + offsetZ, wallThickness, floorSize);
+    }
+    if (!currentRoom.exits.includes("west")) {
+      ctx.fillRect(centerX - floorSize / 2 - wallThickness + offsetX, centerY - floorSize / 2 + offsetZ, wallThickness, floorSize);
+    }
+
+    ctx.fillStyle = "#00ff00";
+    const exitSize = 60;
+    currentRoom.exits.forEach((exit) => {
+      switch (exit) {
+        case "north":
+          ctx.fillRect(centerX - exitSize / 2 + offsetX, centerY - floorSize / 2 - 10 + offsetZ, exitSize, 10);
+          break;
+        case "south":
+          ctx.fillRect(centerX - exitSize / 2 + offsetX, centerY + floorSize / 2 + offsetZ, exitSize, 10);
+          break;
+        case "east":
+          ctx.fillRect(centerX + floorSize / 2 + offsetX, centerY - exitSize / 2 + offsetZ, 10, exitSize);
+          break;
+        case "west":
+          ctx.fillRect(centerX - floorSize / 2 - 10 + offsetX, centerY - exitSize / 2 + offsetZ, 10, exitSize);
+          break;
+      }
+    });
+  };
+
+  const swordImg = new Image();
+  swordImg.src = swordSrc;
+
+  const bowImg = new Image();
+  bowImg.src = "/images/bow.png";
+
+  const SWING_SPEED = 0.1;
+  const SWING_ARC = Math.PI;
+
+  const swingRef = useRef({
+    progress: 0,
+    swinging: false,
+    direction: 1,
+  });
+
+  useEffect(() => {
+    const animateSwing = () => {
+      if (swingRef.current.swinging) {
+        swingRef.current.progress += SWING_SPEED * swingRef.current.direction;
+        if (swingRef.current.progress >= 1) swingRef.current.direction = -2;
+        if (swingRef.current.progress <= 0) {
+          swingRef.current.progress = 0;
+          swingRef.current.swinging = false;
+          swingRef.current.direction = 1;
+        }
+      }
+      requestAnimationFrame(animateSwing);
+    };
+    animateSwing();
+  }, []);
+
+  const drawWeapon = (ctx: CanvasRenderingContext2D, type: string) => {
+    const centerX = CANVAS_WIDTH / 2;
+    const centerY = CANVAS_HEIGHT / 2;
+
+    const dx = mouseRef.current.x - centerX;
+    const dy = mouseRef.current.y - centerY;
+    const mouseAngle = Math.atan2(dy, dx);
+
+    let img: HTMLImageElement;
+    let scale: number;
+
+    if (type === "sword") {
+      img = swordImg;
+      scale = 0.2;
+    } else if (type === "bow") {
+      img = bowImg;
+      scale = 0.45;
+    } else return;
+
+    if (!img.complete) return;
+
+    const w = img.width * scale;
+    const h = img.height * scale;
+
+    ctx.save();
+
+    if (type === "sword" && swingRef.current.swinging) {
+      const swingOffset = SWING_ARC * 2 + swingRef.current.progress * SWING_ARC / 1.5;
+      ctx.rotate(mouseAngle + swingOffset);
+      ctx.drawImage(img, -w / 2 + 12, -h / 2 - 30, w, h);
+    } else if (type === "sword" && !swingRef.current.swinging) {
+      ctx.rotate(mouseAngle);
+      ctx.drawImage(img, -w / 2 + 12, -h / 2 - 30, w, h);
+    }
+    if (type === "bow") {
+      ctx.rotate(mouseAngle);
+      ctx.drawImage(img, -w / 2 + 16, -h / 2, w, h);
+    }
+
+    ctx.restore();
+  };
+
+  const drawProjectiles = (ctx: CanvasRenderingContext2D) => {
+    const centerX = CANVAS_WIDTH / 2;
+    const centerY = CANVAS_HEIGHT / 2;
+
+    projectiles.forEach((proj) => {
+      const screenX = centerX + (proj.position.x - position.x) * TILE_SIZE / 2;
+      const screenY = centerY + (proj.position.z - position.z) * TILE_SIZE / 2;
+
+      // Trail effect
+      const trailLength = 15;
+      const trailDir = proj.velocity.clone().normalize();
+      ctx.strokeStyle = proj.trailColor;
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.moveTo(
+        screenX - trailDir.x * trailLength, 
+        screenY - trailDir.z * trailLength
+      );
+      ctx.lineTo(screenX, screenY);
+      ctx.stroke();
+
+      // Projectile glow
+      const gradient = ctx.createRadialGradient(screenX, screenY, 0, screenX, screenY, 10);
+      gradient.addColorStop(0, proj.color);
+      gradient.addColorStop(0.5, proj.color + "AA");
+      gradient.addColorStop(1, proj.color + "00");
+
+      ctx.fillStyle = gradient;
+      ctx.shadowBlur = 10;
+      ctx.shadowColor = proj.color;
+      ctx.beginPath();
+      ctx.arc(screenX, screenY, 8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      
+      // Special effect indicators
+      if (proj.homing) {
+        ctx.strokeStyle = "#ff00ff";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(screenX, screenY, 12, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      
+      if (proj.explosive) {
+        ctx.strokeStyle = "#ff6600";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(screenX, screenY, 10, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    });
+  };
+
+
+  const drawPlayer = (ctx: CanvasRenderingContext2D) => {
+    const centerX = CANVAS_WIDTH / 2;
+    const centerY = CANVAS_HEIGHT / 2;
+
+    ctx.save();
+    ctx.translate(centerX, centerY);
+
+    ctx.fillStyle = "#4a9eff";
+    ctx.beginPath();
+    ctx.arc(0, 0, 20, 0, Math.PI * 2);
+    ctx.fill();
+
+    const { items, equippedWeaponId } = useInventory.getState();
+    const weapon = items.find(i => i.id === equippedWeaponId);
+    if (weapon) drawWeapon(ctx, weapon.name.toLowerCase());
+
+    ctx.restore();
+  };
+
+  const drawEnemy = (ctx: CanvasRenderingContext2D, enemy: any) => {
+    const centerX = CANVAS_WIDTH / 2;
+    const centerY = CANVAS_HEIGHT / 2;
+
+    const screenX = centerX + (enemy.position.x - position.x) * TILE_SIZE / 2;
+    const screenY = centerY + (enemy.position.z - position.z) * TILE_SIZE / 2;
+
+    ctx.fillStyle = "rgba(0, 0, 0, 0.3)";
+    ctx.beginPath();
+    ctx.ellipse(screenX, screenY + 18, 12, 6, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = "#ff4444";
+    ctx.fillRect(screenX - 12, screenY - 12, 24, 24);
+
+    ctx.fillStyle = "#aa2222";
+    ctx.fillRect(screenX - 8, screenY - 8, 8, 8);
+    ctx.fillRect(screenX + 2, screenY + 2, 8, 8);
+
+    const healthBarWidth = 30;
+    const healthBarHeight = 4;
+    ctx.fillStyle = "#ff0000";
+    ctx.fillRect(screenX - healthBarWidth / 2, screenY - 22, healthBarWidth, healthBarHeight);
+    ctx.fillStyle = "#00ff00";
+    const healthWidth = (enemy.health / enemy.maxHealth) * healthBarWidth;
+    ctx.fillRect(screenX - healthBarWidth / 2, screenY - 22, healthWidth, healthBarHeight);
+  };
+
+  if (phase !== "playing") return null;
+
+  return (
+    <>
+      <canvas
+        ref={canvasRef}
+        width={CANVAS_WIDTH}
+        height={CANVAS_HEIGHT}
+        className="border-2 border-gray-700"
+        style={{ imageRendering: "pixelated" as any }}
+      />
+      
+      {/* Add spell system UI */}
+      {phase === "playing" && (
+        <>
+          <SpellSlotsHUD />
+          {showCardManager && <CardManager />}
+        </>
+      )}
+    </>
+  );
+}
